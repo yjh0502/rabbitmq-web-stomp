@@ -91,11 +91,8 @@ init_processor_state({ConnMod, ConnProps}) ->
 
     Sock = proplists:get_value(socket, Info),
     {PeerAddr, _} = proplists:get_value(peername, Info),
-    AdapterInfo0 = #amqp_adapter_info{additional_info=Extra}
+    AdapterInfo = #amqp_adapter_info{additional_info=Extra}
         = amqp_connection:socket_adapter_info(Sock, {'Web STOMP', 0}),
-    %% Flow control is not supported for Web-STOMP connections.
-    AdapterInfo = AdapterInfo0#amqp_adapter_info{
-        additional_info=[{state, running}|Extra]},
 
     ProcessorState = rabbit_stomp_processor:initial_state(
         StompConfig,
@@ -277,7 +274,7 @@ emit_stats(State=#state{connection = C}) when C == none; C == undefined ->
     %% established, as this causes orphan entries on the stats database
     State1 = rabbit_event:reset_stats_timer(State, #state.stats_timer),
     State1;
-emit_stats(State=#state{conn={ConnMod, ConnProps}, connection=ConnPid}) ->
+emit_stats(State=#state{conn={ConnMod, ConnProps}, state=RunningState, connection=ConnPid}) ->
     Info = ConnMod:info(ConnProps),
     Sock = proplists:get_value(socket, Info),
     SockInfos = case rabbit_net:getstat(Sock,
@@ -285,7 +282,7 @@ emit_stats(State=#state{conn={ConnMod, ConnProps}, connection=ConnPid}) ->
         {ok,    SI} -> SI;
         {error,  _} -> []
     end,
-    Infos = [{pid, ConnPid}|SockInfos],
+    Infos = [{pid, ConnPid}, {state, RunningState}|SockInfos],
     rabbit_core_metrics:connection_stats(ConnPid, Infos),
     rabbit_event:notify(connection_stats, Infos),
     State1 = rabbit_event:reset_stats_timer(State, #state.stats_timer),
