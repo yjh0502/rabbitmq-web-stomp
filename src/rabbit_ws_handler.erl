@@ -27,6 +27,8 @@
 %% SockJS interface
 -export([info/1]).
 -export([send/2]).
+-export([block/1]).
+-export([unblock/1]).
 -export([close/3]).
 
 -record(state, {conn, pid, type}).
@@ -78,6 +80,10 @@ websocket_info({send, Msg}, State=#state{type=FrameType}) ->
     {reply, {FrameType, Msg}, State};
 websocket_info(Frame = {close, _, _}, State) ->
     {reply, Frame, State};
+websocket_info(block, State) ->
+    {[{active, false}], State};
+websocket_info(unblock, State) ->
+    {[{active, true}], State};
 websocket_info(_Info, State) ->
     {ok, State}.
 
@@ -116,6 +122,14 @@ info(#{info := Info}) ->
 
 send(#{pid := Pid}, Data) ->
     Pid ! {send, Data},
+    ok.
+
+block(#{pid := Pid}) ->
+    Pid ! block,
+    ok.
+
+unblock(#{pid := Pid}) ->
+    Pid ! unblock,
     ok.
 
 close(#{pid := Pid}, Code, Reason) ->

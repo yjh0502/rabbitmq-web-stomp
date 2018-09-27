@@ -18,6 +18,7 @@
 -behaviour(gen_server).
 
 -include_lib("rabbitmq_stomp/include/rabbit_stomp.hrl").
+-include_lib("rabbitmq_stomp/include/rabbit_stomp_frame.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
 -export([start_link/1]).
@@ -26,7 +27,7 @@
 -export([init/1, handle_call/3, handle_info/2, terminate/2,
          code_change/3, handle_cast/2]).
 
--record(state, {conn, proc_state, parse_state, stats_timer, connection, heartbeat_mode, heartbeat, heartbeat_sup}).
+-record(state, {conn, proc_state, parse_state, state, conserve_resources, stats_timer, connection, heartbeat_mode, heartbeat, heartbeat_sup}).
 
 %%----------------------------------------------------------------------------
 
@@ -45,13 +46,15 @@ init({SupPid, Conn, Heartbeat}) ->
     ok = file_handle_cache:obtain(),
     process_flag(trap_exit, true),
     {ok, ProcessorState} = init_processor_state(Conn),
-    {ok, rabbit_event:init_stats_timer(
-           #state{conn           = Conn,
-                  proc_state     = ProcessorState,
-                  parse_state    = rabbit_stomp_frame:initial_state(),
-                  heartbeat_sup  = SupPid,
-                  heartbeat      = {none, none},
-                  heartbeat_mode = Heartbeat},
+    {ok, rabbit_event:init_stats_timer(control_throttle(
+           #state{conn               = Conn,
+                  proc_state         = ProcessorState,
+                  parse_state        = rabbit_stomp_frame:initial_state(),
+                  heartbeat_sup      = SupPid,
+                  heartbeat          = {none, none},
+                  heartbeat_mode     = Heartbeat,
+                  state              = running,
+                  conserve_resources = false}),
            #state.stats_timer)}.
 
 init_processor_state({ConnMod, ConnProps}) ->
@@ -99,19 +102,12 @@ init_processor_state({ConnMod, ConnProps}) ->
         {SendFun, AdapterInfo, none, PeerAddr}),
     {ok, ProcessorState}.
 
-handle_cast({msg, Data}, State = #state{proc_state  = ProcessorState,
-                                               parse_state = ParseState,
-                                               connection  = ConnPid}) ->
-    case process_received_bytes(Data, ProcessorState, ParseState, ConnPid) of
-        {ok, NewProcState, ParseState1, ConnPid1} ->
-            {noreply, ensure_stats_timer(State#state{
-                        parse_state = ParseState1,
-                        proc_state  = NewProcState,
-                        connection  = ConnPid1})};
-        {stop, Reason, NewProcState, ParseState1} ->
-            {stop, Reason, State#state{
-                                parse_state = ParseState1,
-                                proc_state  = NewProcState}}
+handle_cast({msg, Data}, State) ->
+    case process_received_bytes(Data, State) of
+        {ok, NewState} ->
+            {noreply, ensure_stats_timer(control_throttle(NewState))};
+        {stop, Reason, NewState} ->
+            {stop, Reason, NewState}
     end;
 
 handle_cast(closed, State) ->
@@ -123,11 +119,12 @@ handle_cast(client_timeout, State) ->
 handle_cast(Cast, State) ->
     {stop, {odd_cast, Cast}, State}.
 
-%% TODO this is a bit rubbish - after the preview release we should
-%% make the credit_flow:send/1 invocation in
-%% rabbit_stomp_processor:process_frame/2 optional.
-handle_info({bump_credit, {_, _}}, State) ->
-    {noreply, State};
+handle_info({conserve_resources, Conserve}, State) ->
+    NewState = State#state{conserve_resources = Conserve},
+    {noreply, control_throttle(NewState)};
+handle_info({bump_credit, Msg}, State) ->
+    credit_flow:handle_bump_msg(Msg),
+    {noreply, control_throttle(State)};
 
 handle_info(#'basic.consume_ok'{}, State) ->
     {noreply, State};
@@ -217,23 +214,54 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------------------------
 
 
-process_received_bytes(Bytes, ProcessorState, ParseState, ConnPid) ->
+process_received_bytes(Bytes, State = #state{
+                         proc_state  = ProcState,
+                         parse_state = ParseState}) ->
     case rabbit_stomp_frame:parse(Bytes, ParseState) of
         {ok, Frame, Rest} ->
-            case rabbit_stomp_processor:process_frame(Frame, ProcessorState) of
+            case rabbit_stomp_processor:process_frame(Frame, ProcState) of
                 {ok, NewProcState, ConnPid1} ->
                     ParseState1 = rabbit_stomp_frame:initial_state(),
-                    process_received_bytes(Rest, NewProcState, ParseState1, ConnPid1);
+                    NextState = maybe_block(State, Frame),
+                    process_received_bytes(Rest, NextState#state{
+                        proc_state  = NewProcState,
+                        parse_state = ParseState1,
+                        connection  = ConnPid1});
                 {stop, Reason, NewProcState} ->
-                    {stop, Reason, NewProcState, ParseState}
+                    {stop, Reason, processor_state(NewProcState, State)}
             end;
         {more, ParseState1} ->
-            {ok, ProcessorState, ParseState1, ConnPid}
+            {ok, State#state{parse_state = ParseState1}}
     end.
 
 processor_state(#state{ proc_state = ProcState }) -> ProcState.
 processor_state(ProcState, #state{} = State) ->
   State#state{ proc_state = ProcState}.
+
+control_throttle(State = #state{state              = CS,
+                                conserve_resources = Mem}) ->
+    case {CS, Mem orelse credit_flow:blocked()} of
+        {running,   true} -> blocking(State);
+        {blocking, false} -> running(State);
+        {blocked,  false} -> running(State);
+        {_,            _} -> State
+    end.
+
+maybe_block(State = #state{conn = {ConnMod, ConnProps}, state = blocking, heartbeat = Heartbeat},
+            #stomp_frame{command = "SEND"}) ->
+    ConnMod:block(ConnProps),
+    rabbit_heartbeat:pause_monitor(Heartbeat),
+    State#state{state = blocked};
+maybe_block(State, _) ->
+    State.
+
+blocking(State) ->
+    State#state{state = blocking}.
+
+running(State = #state{conn = {ConnMod, ConnProps}, heartbeat=Heartbeat}) ->
+    ConnMod:unblock(ConnProps),
+    rabbit_heartbeat:resume_monitor(Heartbeat),
+    State#state{state = running}.
 
 %%----------------------------------------------------------------------------
 
